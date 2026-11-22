@@ -39,7 +39,7 @@ USB 給電の電圧が約 4.9V を下回ると、USB 接続が切れたりリセ
 
 - [Go](https://go.dev/dl/) 1.25 以降
 - [TinyGo](https://tinygo.org/getting-started/install/) 0.41 以降（動作確認: 0.41.1、0.42.0）
-  - `06_ble_color`（Bluetooth）だけは **TinyGo 0.42 以降**が必要です
+  - `06_ble_color` と `07_music_ripple`（Bluetooth）は **TinyGo 0.42 以降**が必要です
 - USB Type-C ケーブル（データ通信に対応したもの）
 
 macOS の場合:
@@ -102,6 +102,7 @@ make monitor                              # シリアルモニタのみ
 | [examples/04_tilt_dot](examples/04_tilt_dot/main.go) | 基板を傾けると光の点が転がる（公式デモの "Game" に相当） |
 | [examples/05_scroll_text](examples/05_scroll_text/main.go) | [tinyfont](https://github.com/tinygo-org/tinyfont) を使って文字列をスクロール表示する |
 | [examples/06_ble_color](examples/06_ble_color/main.go) | Bluetooth LE で Chrome と接続し、ブラウザから LED の色と輝度を変更する（TinyGo 0.42 以降） |
+| [examples/07_music_ripple](examples/07_music_ripple/main.go) | ブラウザで再生した YouTube の音に合わせて、低音のビートで四角い波紋、音の出だしで星を光らせる（TinyGo 0.42 以降） |
 
 最初に `01_color_check` を書き込んで、LED の色の順序と表示の向きを確認してください。
 
@@ -122,7 +123,7 @@ ESP32-S3 内蔵の Bluetooth LE を [tinygo.org/x/bluetooth](https://github.com/
 2. ページを配信する
 
    ```sh
-   make serve    # python3 -m http.server で http://localhost:8080 を配信
+   make serve EXAMPLE=06_ble_color   # python3 -m http.server で http://localhost:8080 を配信
    ```
 
    Web Bluetooth は安全なコンテキストでしか使えません。`http://localhost` は安全とみなされるので、開発中は HTTPS がなくても動きます。
@@ -148,7 +149,79 @@ UUID を変える場合は [main.go](examples/06_ble_color/main.go) と [index.h
 - BLE の書き込みコールバックでは LED を更新せず、チャネルでメインループに値を渡します。LED の送信中は割り込みを禁止するため、BLE スタックの処理の中で行わないようにしています。
 - `tinygo.org/x/bluetooth` v0.17.0 の HCI 実装（ESP32 で使われるもの）は、Write Without Response を受け取っても無視します。そのためブラウザ側は `writeValueWithResponse` で書き込みます。
 - 同じ実装では、ボード側で `Characteristic.Write()` を呼ぶと自分の `WriteEvent` も呼ばれます。読み出し値を更新するときは、`Value` に渡したスライスを直接書き換えています。
+- 同じ実装では、アドバタイズに 128 ビットのサービス UUID を載せられません。そのためブラウザ側は、デバイス名 `S3-Matrix` で探して、サービスへのアクセスは `optionalServices` で許可しています（07 も同じ）。
 - スライダーを動かすと書き込みが大量に届きます。そこで、ボード側もブラウザ側も「最新の値だけ」を残し、古い値は捨てます。
+
+## 07_music_ripple: YouTube の音に合わせて光らせる
+
+ブラウザで YouTube の動画を再生し、その音を解析して LED を光らせます。
+
+- **低音のビート**：中心から四角い波紋が、2x2 → 4x4 → 6x6 → 8x8 の順に外へ広がる
+- **音の出だし（オンセット）**：ランダムな 1 点が星のように光って消える
+- 色相は時間とともに少しずつ虹色に変わる
+
+8x8 では円の波紋はぼやけて見えるので、ピクセルの格子に沿った四角い輪（中心からのチェビシェフ距離で 4 段階）にしています。ボードとの接続は 06 と同じく Web Bluetooth です。
+
+### 仕組み
+
+埋め込んだ YouTube（iframe）は別オリジンなので、ページから音声データを直接は読めません。そこで、Chrome の画面共有 API（`getDisplayMedia`）で**自分のタブの音声**を取り込み、Web Audio API の `AnalyserNode` で解析します。
+
+```text
+[Chrome]  YouTube iframe ──タブ音声の取り込み──▶ AnalyserNode (FFT)
+                                                  │ 低音 40〜150Hz のエネルギー
+                                                  │ 40Hz〜5kHz の spectral flux
+                                                  ▼
+                                    低音ビート / オンセット検出
+                                                  │ BLE で 4 バイト
+[ボード]  ◀───────────────────────────────────────┘
+          番号が変わったら波紋や星を出す。アニメーションはボード側で約 40fps で描く
+```
+
+ビートは 2 種類の方法で検出します。
+
+- **低音ビート**：低音のエネルギーが、最近の平均より大きく跳ね上がったとき。キックドラムのはっきりした曲向けです。
+- **オンセット（音の出だし）**：40Hz〜5kHz で前のフレームより強くなった成分の合計（spectral flux）が、直近約 0.7 秒の「平均 + k × 標準偏差」を超えたとき。ピアノ曲やバラードなど、ビートの分かりにくい曲向けの補助です。直近 1.2 秒に低音ビートがあればこちらは使わず、波紋も少し弱めにします。
+
+ビートの判定はブラウザで、描画はボードで行います。BLE の書き込みは応答待ちが必要で、毎秒 20〜30 回程度が上限の見込みです。この分担にしておくと、通信の間隔が空いてもアニメーションは滑らかに動きます。ビートとオンセットはそれぞれ「番号」で送るので、途中の書き込みが最新値で上書きされても、ビートを取りこぼしません。
+
+### 手順
+
+1. ボードに書き込む（TinyGo 0.42 以降）
+
+   ```sh
+   make flash EXAMPLE=07_music_ripple
+   ```
+
+   BLE の準備ができると、中心から弱い波紋がゆっくり出る待機表示になります。
+
+2. ページを配信する
+
+   ```sh
+   make serve EXAMPLE=07_music_ripple
+   ```
+
+3. Chrome で <http://localhost:8080> を開き、次の順に操作する
+   1. 「接続する」を押して `S3-Matrix` を選ぶ
+   2. YouTube の URL（または動画 ID）を入力して「読み込む」を押し、再生する
+   3. 「このタブの音声を取り込む」を押す。共有ダイアログで**このタブ**を選び、**「タブの音声も共有する」をオン**にして共有する
+
+   ページのメーターが低音に合わせて動き、ビートで丸が光れば解析できています（低音ビートは青、オンセットは紫）。ビートを拾いすぎる、または拾わない場合は「ビートの感度」を調整してください。
+
+### 注意
+
+- 使えるのは Chrome / Edge のデスクトップ版だけです（タブ音声の取り込みに対応していないブラウザがあるため）。
+- 埋め込み再生が許可されていない動画は再生できません。
+- タブを裏に回すと `requestAnimationFrame` が止まり、解析も止まります。このタブを表示したままにしてください。
+- 音の情報が 1.5 秒以上届かないと、ボードは待機表示に戻ります（一時停止したときなど）。
+- 波紋の速さ・残像の長さ、星の消え方、色相が変わる速さは [main.go](examples/07_music_ripple/main.go) 冒頭の定数で調整できます。
+
+### GATT の構成
+
+| 項目 | UUID | 内容 |
+| --- | --- | --- |
+| サービス | `6e400011-7a3c-4f1b-9d2e-5c8b1f0a3e01` | 06 とは別の UUID（06 のページで接続しても、サービスが見つからずエラーになる） |
+| 音の情報 | `6e400012-7a3c-4f1b-9d2e-5c8b1f0a3e01` | 4 バイト（低音レベル 0〜255、低音ビート番号、オンセット番号、強さ 0〜255）。Write |
+| 輝度 | `6e400013-7a3c-4f1b-9d2e-5c8b1f0a3e01` | 1 バイト（06 と同じ）。Read / Write |
 
 ## リポジトリ構成
 
@@ -158,7 +231,7 @@ UUID を変える場合は [main.go](examples/06_ble_color/main.go) と [index.h
 ├── matrix/     8x8 LED のフレームバッファ（drivers.Displayer を実装）
 ├── ws2812s3/   ESP32-S3 用 WS2812 ドライバ（ビットバンギング）
 ├── qmi8658/    QMI8658 IMU の最小限のドライバ
-└── examples/   サンプルプログラム（06_ble_color/web/ はブラウザ側の HTML）
+└── examples/   サンプルプログラム（06・07 の web/ はブラウザ側の HTML）
 ```
 
 ### `matrix` パッケージ

@@ -26,9 +26,11 @@ build-all:
 		tinygo build -target $(TARGET) -o build/$$e.bin ./examples/$$e || exit 1; \
 	done
 
-## 06_ble_color のブラウザ側ページを http://localhost:8080 で配信する
+## ブラウザ側ページを http://localhost:8080 で配信する
+## make serve EXAMPLE=07_music_ripple（EXAMPLE に web/ がなければ 06_ble_color）
+WEB_DIR := $(if $(wildcard examples/$(EXAMPLE)/web),examples/$(EXAMPLE)/web,examples/06_ble_color/web)
 serve:
-	python3 -m http.server 8080 --bind 127.0.0.1 -d examples/06_ble_color/web
+	python3 -m http.server 8080 --bind 127.0.0.1 -d $(WEB_DIR)
 
 clean:
 	rm -rf build

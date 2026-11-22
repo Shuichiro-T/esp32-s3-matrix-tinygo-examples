@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3-Matrix Music Ripple</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73;
+    --accent: #0071e3; --border: #d2d2d7; --ok: #1f9d55; --ng: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111114; --card: #1c1c20; --text: #f5f5f7; --muted: #a1a1a6;
+      --accent: #2997ff; --border: #3a3a3f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 16px; }
+  h2 { font-size: 1rem; margin: 0 0 12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  button {
+    font: inherit; border: 0; border-radius: 10px; padding: 10px 16px;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  .wide { width: 100%; }
+  .row { display: flex; gap: 8px; }
+  .row input[type=text] { flex: 1; min-width: 0; }
+  input[type=text] {
+    font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  .status { margin-top: 10px; font-size: .9rem; color: var(--muted); }
+  .status.ok { color: var(--ok); }
+  .status.ng { color: var(--ng); }
+  .player { margin-top: 12px; aspect-ratio: 16 / 9; background: #000; border-radius: 10px; overflow: hidden; }
+  .player iframe, .player > div { width: 100%; height: 100%; display: block; }
+  label { display: block; font-size: .9rem; color: var(--muted); margin: 14px 0 6px; }
+  input[type=range] { width: 100%; }
+  .meter { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .bar { flex: 1; height: 14px; border-radius: 7px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
+  .bar span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #ff3b30, #ff9500, #ffcc00, #34c759, #0a84ff, #bf5af2); }
+  .beat { width: 22px; height: 22px; border-radius: 50%; background: var(--border); transition: background .15s, transform .15s; }
+  .beat.on { background: var(--accent); transform: scale(1.25); transition: none; }
+  .beat.on.onset { background: #bf5af2; transform: scale(1.1); }
+  .stats { font-size: .8rem; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .note { font-size: .8rem; color: var(--muted); line-height: 1.6; }
+  .note ol { padding-left: 1.2em; margin: 6px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ESP32-S3-Matrix Music Ripple</h1>
+
+  <div class="card">
+    <h2>1. ボードに接続</h2>
+    <button id="connect" class="wide">接続する</button>
+    <div id="bleStatus" class="status">未接続</div>
+    <label for="brightness">輝度 <span id="brightnessValue">24</span> / 64</label>
+    <input id="brightness" type="range" min="0" max="64" value="24" disabled>
+  </div>
+
+  <div class="card">
+    <h2>2. 動画を選ぶ</h2>
+    <form id="videoForm" class="row">
+      <input id="videoUrl" type="text" placeholder="YouTube の URL または動画 ID" autocomplete="off">
+      <button type="submit">読み込む</button>
+    </form>
+    <div id="videoStatus" class="status"></div>
+    <div class="player"><div id="player"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>3. 音の解析を始める</h2>
+    <button id="capture" class="wide">このタブの音声を取り込む</button>
+    <div id="captureStatus" class="status">
+      共有ダイアログで「このタブ」を選び、「タブの音声も共有する」をオンにしてください。
+    </div>
+    <div class="meter">
+      <div class="bar"><span id="bassBar"></span></div>
+      <div id="beat" class="beat" title="ビート"></div>
+    </div>
+    <div id="stats" class="stats">低音ビート 0 回 / オンセット 0 回 / 送信 0 回/秒</div>
+    <label for="sensitivity">ビートの感度 <span id="sensitivityValue">5</span></label>
+    <input id="sensitivity" type="range" min="1" max="10" value="5">
+  </div>
+
+  <div class="note">
+    <ol>
+      <li>Chrome / Edge のデスクトップ版で、<code>http://localhost</code> から開いてください（Web Bluetooth とタブ音声の取り込みを使います）。</li>
+      <li>埋め込みが許可されていない動画は再生できません。</li>
+      <li>タブを裏に回すと解析が止まります。このタブを表示したままにしてください。</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+// main.go と同じ UUID
+const SERVICE_UUID    = "6e400011-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const AUDIO_UUID      = "6e400012-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const BRIGHTNESS_UUID = "6e400013-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const DEVICE_NAME     = "S3-Matrix";
+
+// 低音として扱う周波数の範囲 (Hz)
+const BASS_LOW = 40, BASS_HIGH = 150;
+// 同じビートを二重に数えないための最小間隔 (ms)
+const MIN_BEAT_INTERVAL = 180;
+
+// オンセット（音の出だし）検出: ビートの分かりにくい曲向けの補助。
+const ONSET_LOW = 40, ONSET_HIGH = 5000;  // 見る周波数の範囲 (Hz)
+const ONSET_HISTORY = 40;                 // しきい値を決める履歴のフレーム数（約 0.7 秒）
+const MIN_ONSET_INTERVAL = 250;           // オンセットの最小間隔 (ms)
+const BASS_PRIORITY = 1200;               // 低音ビートがこの時間内にあれば、オンセットでは波紋を出さない (ms)
+const ONSET_MIN_FLUX = 0.4;               // 無音に近いときの誤検出を防ぐ下限（dB の平均増加量）
+
+const $ = (id) => document.getElementById(id);
+function setStatus(el, text, cls = "") {
+  el.textContent = text;
+  el.className = "status " + cls;
+}
+
+/* ---------------- Bluetooth ---------------- */
+
+const connectBtn = $("connect"), bleStatus = $("bleStatus");
+const brightnessInput = $("brightness"), brightnessValue = $("brightnessValue");
+let device = null, audioChar = null, brightnessChar = null;
+let writeCount = 0;
+
+// GATT への書き込みは同時に 1 つしか実行できないので、
+// 特性ごとに「最新の値だけ」を保持して順番に送る。
+function makeWriter(getChar) {
+  let pending = null, busy = false;
+  return async function write(bytes) {
+    pending = bytes;
+    if (busy) return;
+    busy = true;
+    try {
+      while (pending) {
+        const v = pending; pending = null;
+        const ch = getChar();
+        if (!ch) break;
+        // ボード側（ESP32 の HCI 実装）は Write Without Response を無視するので、
+        // 必ず応答ありの書き込みを使う。
+        await ch.writeValueWithResponse(v);
+        writeCount++;
+      }
+    } catch (e) {
+      console.error(e);
+      if (device?.gatt.connected) setStatus(bleStatus, "書き込みエラー: " + e.message, "ng");
+    } finally {
+      busy = false;
+    }
+  };
+}
+const writeAudio = makeWriter(() => audioChar);
+const writeBrightness = makeWriter(() => brightnessChar);
+
+brightnessInput.addEventListener("input", () => {
+  brightnessValue.textContent = brightnessInput.value;
+  writeBrightness(new Uint8Array([Number(brightnessInput.value)]));
+});
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus(bleStatus, "このブラウザは Web Bluetooth に対応していません。Chrome で開いてください。", "ng");
+    return;
+  }
+  try {
+    setStatus(bleStatus, "デバイスを選択してください…");
+    // ボード側（ESP32 の HCI 実装）はアドバタイズに 128 ビットのサービス UUID を
+    // 載せられないので、名前で探す。サービスへのアクセスは optionalServices で許可する。
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: DEVICE_NAME }, { services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    setStatus(bleStatus, "接続中…");
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    audioChar = await service.getCharacteristic(AUDIO_UUID);
+    brightnessChar = await service.getCharacteristic(BRIGHTNESS_UUID);
+
+    const b = new Uint8Array((await brightnessChar.readValue()).buffer);
+    if (b.length === 1) {
+      brightnessInput.value = b[0];
+      brightnessValue.textContent = b[0];
+    }
+    brightnessInput.disabled = false;
+    connectBtn.textContent = "切断する";
+    connectBtn.className = "wide secondary";
+    setStatus(bleStatus, "接続済み: " + (device.name || DEVICE_NAME), "ok");
+  } catch (e) {
+    console.error(e);
+    if (e.name === "NotFoundError") setStatus(bleStatus, "キャンセルされました");
+    else setStatus(bleStatus, "接続エラー: " + e.message, "ng");
+    if (device?.gatt.connected) device.gatt.disconnect();
+  }
+}
+
+function onDisconnected() {
+  audioChar = brightnessChar = null;
+  brightnessInput.disabled = true;
+  connectBtn.textContent = "接続する";
+  connectBtn.className = "wide";
+  setStatus(bleStatus, "切断されました");
+}
+
+connectBtn.addEventListener("click", () => {
+  if (device?.gatt.connected) device.gatt.disconnect();
+  else connect();
+});
+
+/* ---------------- YouTube ---------------- */
+
+const videoStatus = $("videoStatus");
+let player = null, playerReady = false, queuedId = null;
+
+// URL（watch / youtu.be / shorts / embed / live）または 11 文字の ID から動画 ID を取り出す。
+function parseVideoId(input) {
+  const s = input.trim();
+  if (/^[\w-]{11}$/.test(s)) return s;
+  try {
+    const u = new URL(s);
+    if (u.hostname === "youtu.be") return u.pathname.slice(1, 12) || null;
+    if (u.hostname.endsWith("youtube.com") || u.hostname.endsWith("youtube-nocookie.com")) {
+      const v = u.searchParams.get("v");
+      if (v) return v;
+      const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]{11})/);
+      if (m) return m[1];
+    }
+  } catch {}
+  return null;
+}
+
+const PLAYER_ERRORS = {
+  2: "動画 ID が正しくありません。",
+  5: "この動画はブラウザで再生できません。",
+  100: "動画が見つかりません（削除または非公開）。",
+  101: "この動画は埋め込み再生が許可されていません。",
+  150: "この動画は埋め込み再生が許可されていません。",
+};
+
+window.onYouTubeIframeAPIReady = () => {
+  player = new YT.Player("player", {
+    playerVars: { playsinline: 1, rel: 0 },
+    events: {
+      onReady: () => {
+        playerReady = true;
+        if (queuedId) { player.loadVideoById(queuedId); queuedId = null; }
+      },
+      onError: (e) => setStatus(videoStatus, PLAYER_ERRORS[e.data] || "再生エラー（" + e.data + "）", "ng"),
+      onStateChange: (e) => {
+        if (e.data === YT.PlayerState.PLAYING) setStatus(videoStatus, "再生中", "ok");
+      },
+    },
+  });
+};
+{
+  const s = document.createElement("script");
+  s.src = "https://www.youtube.com/iframe_api";
+  document.head.appendChild(s);
+}
+
+$("videoForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const id = parseVideoId($("videoUrl").value);
+  if (!id) {
+    setStatus(videoStatus, "YouTube の URL または動画 ID を入力してください。", "ng");
+    return;
+  }
+  setStatus(videoStatus, "読み込み中…");
+  if (playerReady) player.loadVideoById(id);
+  else queuedId = id;
+});
+
+/* ---------------- 音声の取り込みと解析 ---------------- */
+
+const captureBtn = $("capture"), captureStatus = $("captureStatus");
+const bassBar = $("bassBar"), beatEl = $("beat"), statsEl = $("stats");
+const sensitivityInput = $("sensitivity"), sensitivityValue = $("sensitivityValue");
+
+let audioCtx = null, stream = null, analyser = null, freq = null, prevFreq = null;
+let binLow = 0, binHigh = 0, onsetLow = 0, onsetHigh = 0;
+
+// 解析の状態
+let avgEnergy = 0;      // 低音エネルギーのゆっくりした平均
+let peakDb = -40;       // 低音レベルの基準（自動で追従する）
+let bassCount = 0, onsetCount = 0, lastStrength = 0;
+let bassTotal = 0, onsetTotal = 0;
+let lastBassAt = -Infinity, lastOnsetAt = -Infinity;
+let fluxHistory = [];
+let lastSent = "";
+
+// 感度 1〜10 を「平均の何倍でビートとみなすか」に変換する（高感度ほど小さい）。
+function beatThreshold() {
+  return 2.4 - (Number(sensitivityInput.value) - 1) * 0.12;
+}
+// 感度 1〜10 を、オンセットのしきい値「平均 + k × 標準偏差」の k に変換する。
+function onsetK() {
+  return 2.6 - (Number(sensitivityInput.value) - 1) * 0.15;
+}
+sensitivityInput.addEventListener("input", () => {
+  sensitivityValue.textContent = sensitivityInput.value;
+});
+
+async function startCapture() {
+  // ユーザー操作の直後に作っておかないと、AudioContext が止まったままになることがある。
+  audioCtx = new AudioContext();
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true, // Chrome では video を要求しないと音声だけの共有ができない
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        suppressLocalAudioPlayback: false, // 取り込み中もスピーカーから音を出す
+      },
+      preferCurrentTab: true,
+      selfBrowserSurface: "include",
+      surfaceSwitching: "exclude",
+      systemAudio: "exclude",
+    });
+  } catch (e) {
+    console.error(e);
+    audioCtx.close(); audioCtx = null;
+    setStatus(captureStatus, e.name === "NotAllowedError" ? "キャンセルされました" : "取り込みエラー: " + e.message, "ng");
+    return;
+  }
+
+  const audioTracks = stream.getAudioTracks();
+  if (audioTracks.length === 0) {
+    stopCapture();
+    setStatus(captureStatus, "音声が共有されていません。「タブの音声も共有する」をオンにしてやり直してください。", "ng");
+    return;
+  }
+  // 映像は使わないので止める（音声トラックは生きたまま）。
+  stream.getVideoTracks().forEach((t) => t.stop());
+  audioTracks[0].addEventListener("ended", () => {
+    stopCapture();
+    setStatus(captureStatus, "音声の取り込みが終了しました");
+  });
+
+  await audioCtx.resume();
+  const source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0; // ビートを鈍らせないよう平滑化しない
+  source.connect(analyser); // 解析するだけで、出力先には繋がない
+  freq = new Float32Array(analyser.frequencyBinCount);
+  prevFreq = null;
+  const hzPerBin = audioCtx.sampleRate / analyser.fftSize;
+  binLow = Math.max(1, Math.floor(BASS_LOW / hzPerBin));
+  binHigh = Math.max(binLow + 1, Math.ceil(BASS_HIGH / hzPerBin));
+  onsetLow = Math.max(1, Math.floor(ONSET_LOW / hzPerBin));
+  onsetHigh = Math.min(freq.length - 1, Math.ceil(ONSET_HIGH / hzPerBin));
+
+  avgEnergy = 0;
+  fluxHistory = [];
+  captureBtn.textContent = "取り込みを停止";
+  captureBtn.className = "wide secondary";
+  setStatus(captureStatus, "解析中", "ok");
+  requestAnimationFrame(analyze);
+}
+
+function stopCapture() {
+  stream?.getTracks().forEach((t) => t.stop());
+  stream = null; analyser = null;
+  audioCtx?.close(); audioCtx = null;
+  captureBtn.textContent = "このタブの音声を取り込む";
+  captureBtn.className = "wide";
+  bassBar.style.width = "0";
+}
+
+captureBtn.addEventListener("click", () => {
+  if (stream) {
+    stopCapture();
+    setStatus(captureStatus, "停止しました");
+  } else {
+    startCapture();
+  }
+});
+
+function analyze(now) {
+  if (!analyser) return;
+
+  // 低音帯域のエネルギー（dB を線形のパワーに戻して平均する）
+  analyser.getFloatFrequencyData(freq);
+  let energy = 0;
+  for (let i = binLow; i <= binHigh; i++) energy += 10 ** (freq[i] / 10);
+  energy /= binHigh - binLow + 1;
+  const db = 10 * Math.log10(energy + 1e-12);
+
+  // 低音レベル 0〜1: 最近の最大値から 30dB 下までを 0〜1 に割り当てる。
+  // 最大値はゆっくり下がるので、音量の違う曲でも自動で合う。
+  peakDb = Math.max(peakDb - 0.02, db, -60);
+  const level = Math.min(1, Math.max(0, (db - (peakDb - 30)) / 30));
+
+  // 低音ビート: 低音エネルギーが最近の平均より十分大きく跳ね上がったらビート。
+  const ratio = avgEnergy > 0 ? energy / avgEnergy : 0;
+  if (ratio > beatThreshold() && db > peakDb - 25 && now - lastBassAt > MIN_BEAT_INTERVAL) {
+    lastBassAt = now;
+    bassTotal++;
+    fireBeat(Math.min(1, (ratio - beatThreshold()) / 3 + 0.3), "bass");
+  }
+  avgEnergy = avgEnergy * 0.95 + energy * 0.05;
+
+  // オンセット: 前のフレームより強くなった成分の合計（spectral flux）が、
+  // 直近の「平均 + k × 標準偏差」を超えたら音の出だしとみなす。
+  // dB の差を使うので、曲の音量に左右されにくい。
+  let flux = 0;
+  if (prevFreq) {
+    for (let i = onsetLow; i <= onsetHigh; i++) {
+      const d = Math.max(freq[i], -100) - Math.max(prevFreq[i], -100);
+      if (d > 0) flux += d;
+    }
+    flux /= onsetHigh - onsetLow + 1;
+  } else {
+    prevFreq = new Float32Array(freq.length);
+  }
+  prevFreq.set(freq);
+
+  if (fluxHistory.length >= ONSET_HISTORY / 2) {
+    const mean = fluxHistory.reduce((a, b) => a + b, 0) / fluxHistory.length;
+    const sd = Math.sqrt(fluxHistory.reduce((a, b) => a + (b - mean) ** 2, 0) / fluxHistory.length);
+    const z = sd > 0 ? (flux - mean) / sd : 0;
+    if (z > onsetK() && flux > ONSET_MIN_FLUX && now - lastOnsetAt > MIN_ONSET_INTERVAL) {
+      lastOnsetAt = now;
+      // 低音ビートがはっきり出ている曲では、低音ビートだけで波紋を出す。
+      if (now - lastBassAt > BASS_PRIORITY) {
+        onsetTotal++;
+        // 低音ビートと区別できるよう、少し弱めの波紋にする。
+        fireBeat(Math.min(0.6, 0.2 + (z - onsetK()) * 0.1), "onset");
+      }
+    }
+  }
+  fluxHistory.push(flux);
+  if (fluxHistory.length > ONSET_HISTORY) fluxHistory.shift();
+
+  bassBar.style.width = (level * 100).toFixed(1) + "%";
+
+  // ボードへ送る: [低音レベル, 低音ビート番号, オンセット番号, 強さ]。変化がなければ送らない。
+  // ボードは番号が変わったことで検出を知るので、途中の書き込みが上書きされても取りこぼさない。
+  const packet = [Math.round(level * 255), bassCount, onsetCount, Math.round(lastStrength * 255)];
+  const key = packet.join(",");
+  if (key !== lastSent) {
+    lastSent = key;
+    writeAudio(new Uint8Array(packet));
+  }
+
+  requestAnimationFrame(analyze);
+}
+
+// 番号を進め、ページの丸を光らせる（低音ビートは青、オンセットは紫）。
+// ボード側では、低音ビートで四角い波紋、オンセットで星を出す。
+function fireBeat(strength, kind) {
+  if (kind === "bass") bassCount = (bassCount + 1) & 0xff;
+  else onsetCount = (onsetCount + 1) & 0xff;
+  lastStrength = strength;
+  beatEl.classList.remove("bass", "onset");
+  beatEl.classList.add("on", kind);
+  setTimeout(() => beatEl.classList.remove("on"), 60);
+}
+
+// BLE で実際に送れた回数を 1 秒ごとに表示する（通信速度の目安）。
+setInterval(() => {
+  statsEl.textContent = `低音ビート ${bassTotal} 回 / オンセット ${onsetTotal} 回 / 送信 ${writeCount} 回/秒`;
+  writeCount = 0;
+}, 1000);
+</script>
+</body>
+</html>
