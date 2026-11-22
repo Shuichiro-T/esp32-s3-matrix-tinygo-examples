@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3-Matrix BLE Color</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73;
+    --accent: #0071e3; --border: #d2d2d7; --ok: #1f9d55; --ng: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111114; --card: #1c1c20; --text: #f5f5f7; --muted: #a1a1a6;
+      --accent: #2997ff; --border: #3a3a3f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif;
+  }
+  main { max-width: 420px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  button {
+    font: inherit; border: 0; border-radius: 10px; padding: 10px 16px;
+    background: var(--accent); color: #fff; cursor: pointer; width: 100%;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  .status { margin-top: 10px; font-size: .9rem; color: var(--muted); }
+  .status.ok { color: var(--ok); }
+  .status.ng { color: var(--ng); }
+  .preview {
+    width: 100%; aspect-ratio: 1; border-radius: 10px; border: 1px solid var(--border);
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; padding: 8px; background: #000;
+  }
+  .preview span { border-radius: 50%; background: var(--c, #00f); opacity: var(--o, 1); }
+  label { display: block; font-size: .9rem; color: var(--muted); margin: 14px 0 6px; }
+  input[type=color] { width: 100%; height: 48px; border: 0; padding: 0; background: none; cursor: pointer; }
+  input[type=range] { width: 100%; }
+  .swatches { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+  .swatches button { aspect-ratio: 1; padding: 0; border-radius: 8px; border: 1px solid var(--border); }
+  fieldset { border: 0; padding: 0; margin: 0; }
+  fieldset:disabled { opacity: .5; }
+  .note { font-size: .8rem; color: var(--muted); line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ESP32-S3-Matrix BLE Color</h1>
+
+  <div class="card">
+    <button id="connect">接続する</button>
+    <div id="status" class="status">未接続</div>
+  </div>
+
+  <fieldset id="controls" class="card" disabled>
+    <div id="preview" class="preview"></div>
+
+    <label for="color">色</label>
+    <input id="color" type="color" value="#0000ff">
+
+    <label>プリセット</label>
+    <div id="swatches" class="swatches"></div>
+
+    <label for="brightness">輝度 <span id="brightnessValue">20</span> / 64</label>
+    <input id="brightness" type="range" min="0" max="64" value="20">
+  </fieldset>
+
+  <p class="note">
+    Chrome / Edge（デスクトップ・Android）の Web Bluetooth を使います。
+    ページは <code>http://localhost</code> か HTTPS で開いてください。
+  </p>
+</main>
+
+<script>
+// main.go と同じ UUID
+const SERVICE_UUID    = "6e400001-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const COLOR_UUID      = "6e400002-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const BRIGHTNESS_UUID = "6e400003-7a3c-4f1b-9d2e-5c8b1f0a3e01";
+const DEVICE_NAME     = "S3-Matrix";
+
+const $ = (id) => document.getElementById(id);
+const connectBtn = $("connect"), statusEl = $("status"), controls = $("controls");
+const colorInput = $("color"), brightnessInput = $("brightness"), brightnessValue = $("brightnessValue");
+
+let device = null, colorChar = null, brightnessChar = null;
+
+// プレビュー（8x8）
+for (let i = 0; i < 64; i++) $("preview").appendChild(document.createElement("span"));
+function updatePreview() {
+  const p = $("preview");
+  p.style.setProperty("--c", colorInput.value);
+  // 輝度 0〜64 を見た目の明るさにざっくり対応させる
+  p.style.setProperty("--o", (0.15 + 0.85 * brightnessInput.value / 64).toFixed(2));
+  brightnessValue.textContent = brightnessInput.value;
+}
+
+// プリセット
+const presets = ["#ff0000", "#ff8000", "#ffff00", "#00ff00", "#00ffff", "#0000ff", "#ff00ff", "#ffffff"];
+for (const c of presets) {
+  const b = document.createElement("button");
+  b.style.background = c;
+  b.title = c;
+  b.addEventListener("click", () => { colorInput.value = c; onColorInput(); });
+  $("swatches").appendChild(b);
+}
+
+function setStatus(text, cls = "") {
+  statusEl.textContent = text;
+  statusEl.className = "status " + cls;
+}
+
+// GATT への書き込みは同時に 1 つしか実行できないので、
+// 特性ごとに「最新の値だけ」を保持して順番に送る。
+function makeWriter(getChar) {
+  let pending = null, busy = false;
+  return async function write(bytes) {
+    pending = bytes;
+    if (busy) return;
+    busy = true;
+    try {
+      while (pending) {
+        const v = pending; pending = null;
+        const ch = getChar();
+        if (!ch) break;
+        // ボード側（ESP32 の HCI 実装）は Write Without Response を無視するので、
+        // 必ず応答ありの書き込みを使う。
+        await ch.writeValueWithResponse(v);
+      }
+    } catch (e) {
+      console.error(e);
+      setStatus("書き込みエラー: " + e.message, "ng");
+    } finally {
+      busy = false;
+    }
+  };
+}
+const writeColor = makeWriter(() => colorChar);
+const writeBrightness = makeWriter(() => brightnessChar);
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return new Uint8Array([(n >> 16) & 255, (n >> 8) & 255, n & 255]);
+}
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function onColorInput() {
+  updatePreview();
+  writeColor(hexToRgb(colorInput.value));
+}
+colorInput.addEventListener("input", onColorInput);
+brightnessInput.addEventListener("input", () => {
+  updatePreview();
+  writeBrightness(new Uint8Array([Number(brightnessInput.value)]));
+});
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus("このブラウザは Web Bluetooth に対応していません。Chrome で開いてください。", "ng");
+    return;
+  }
+  try {
+    setStatus("デバイスを選択してください…");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }, { name: DEVICE_NAME }],
+      optionalServices: [SERVICE_UUID],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    setStatus("接続中…");
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    colorChar = await service.getCharacteristic(COLOR_UUID);
+    brightnessChar = await service.getCharacteristic(BRIGHTNESS_UUID);
+
+    // 現在の値を読み込んで UI に反映
+    const c = new Uint8Array((await colorChar.readValue()).buffer);
+    if (c.length === 3) colorInput.value = rgbToHex(c[0], c[1], c[2]);
+    const b = new Uint8Array((await brightnessChar.readValue()).buffer);
+    if (b.length === 1) brightnessInput.value = b[0];
+    updatePreview();
+
+    controls.disabled = false;
+    connectBtn.textContent = "切断する";
+    connectBtn.className = "secondary";
+    setStatus("接続済み: " + (device.name || "(名前なし)"), "ok");
+  } catch (e) {
+    console.error(e);
+    if (e.name === "NotFoundError") setStatus("キャンセルされました");
+    else setStatus("接続エラー: " + e.message, "ng");
+    if (device?.gatt.connected) device.gatt.disconnect();
+  }
+}
+
+function onDisconnected() {
+  colorChar = brightnessChar = null;
+  controls.disabled = true;
+  connectBtn.textContent = "接続する";
+  connectBtn.className = "";
+  setStatus("切断されました");
+}
+
+connectBtn.addEventListener("click", () => {
+  if (device?.gatt.connected) device.gatt.disconnect();
+  else connect();
+});
+
+updatePreview();
+</script>
+</body>
+</html>

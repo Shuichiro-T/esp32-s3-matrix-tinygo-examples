@@ -37,8 +37,9 @@ USB 給電の電圧が約 4.9V を下回ると、USB 接続が切れたりリセ
 
 ## 必要なもの
 
-- [Go](https://go.dev/dl/) 1.22 以降
-- [TinyGo](https://tinygo.org/getting-started/install/) 0.41 以降（動作確認: 0.41.1）
+- [Go](https://go.dev/dl/) 1.25 以降
+- [TinyGo](https://tinygo.org/getting-started/install/) 0.41 以降（動作確認: 0.41.1、0.42.0）
+  - `06_ble_color`（Bluetooth）だけは **TinyGo 0.42 以降**が必要です
 - USB Type-C ケーブル（データ通信に対応したもの）
 
 macOS の場合:
@@ -46,6 +47,9 @@ macOS の場合:
 ```sh
 brew tap tinygo-org/tools
 brew install tinygo
+
+# 0.41 からアップデートする場合
+brew upgrade tinygo
 ```
 
 TinyGo のターゲットには `esp32s3-generic` を使います。
@@ -97,8 +101,54 @@ make monitor                              # シリアルモニタのみ
 | [examples/03_imu_serial](examples/03_imu_serial/main.go) | QMI8658 の加速度・角速度・温度を USB シリアルに出力する |
 | [examples/04_tilt_dot](examples/04_tilt_dot/main.go) | 基板を傾けると光の点が転がる（公式デモの "Game" に相当） |
 | [examples/05_scroll_text](examples/05_scroll_text/main.go) | [tinyfont](https://github.com/tinygo-org/tinyfont) を使って文字列をスクロール表示する |
+| [examples/06_ble_color](examples/06_ble_color/main.go) | Bluetooth LE で Chrome と接続し、ブラウザから LED の色と輝度を変更する（TinyGo 0.42 以降） |
 
 最初に `01_color_check` を書き込んで、LED の色の順序と表示の向きを確認してください。
+
+## 06_ble_color: ブラウザから Bluetooth で色を変える
+
+ESP32-S3 内蔵の Bluetooth LE を [tinygo.org/x/bluetooth](https://github.com/tinygo-org/bluetooth) で使い、GATT サーバとして動かします。ブラウザ側は Chrome の [Web Bluetooth API](https://developer.mozilla.org/ja/docs/Web/API/Web_Bluetooth_API) を使った 1 枚の HTML（[web/index.html](examples/06_ble_color/web/index.html)）です。
+
+### 手順
+
+1. ボードに書き込む（TinyGo 0.42 以降）
+
+   ```sh
+   make flash EXAMPLE=06_ble_color
+   ```
+
+   起動するとマトリクスが暗い白で点灯し、BLE の準備ができると青に変わります。デバイス名 `S3-Matrix` でアドバタイズを始めます。
+
+2. ページを配信する
+
+   ```sh
+   make serve    # python3 -m http.server で http://localhost:8080 を配信
+   ```
+
+   Web Bluetooth は安全なコンテキストでしか使えません。`http://localhost` は安全とみなされるので、開発中は HTTPS がなくても動きます。
+
+3. Chrome で <http://localhost:8080> を開き、「接続する」を押して `S3-Matrix` を選ぶ
+
+   カラーピッカー・プリセット・輝度スライダーを操作すると、その場で LED に反映されます。
+
+macOS では「システム設定 → プライバシーとセキュリティ → Bluetooth」で Chrome を許可しておく必要があります。Web Bluetooth は Chrome / Edge（デスクトップ・Android）で使えます。Safari、Firefox、iOS のブラウザは対応していません。
+
+### GATT の構成
+
+| 項目 | UUID | 内容 |
+| --- | --- | --- |
+| サービス | `6e400001-7a3c-4f1b-9d2e-5c8b1f0a3e01` | |
+| 色 | `6e400002-7a3c-4f1b-9d2e-5c8b1f0a3e01` | 3 バイト（R, G, B）。Read / Write |
+| 輝度 | `6e400003-7a3c-4f1b-9d2e-5c8b1f0a3e01` | 1 バイト（0〜255、`board.MaxBrightness` で切り詰め）。Read / Write |
+
+UUID を変える場合は [main.go](examples/06_ble_color/main.go) と [index.html](examples/06_ble_color/web/index.html) の両方を書き換えてください。
+
+### 実装上の工夫
+
+- BLE の書き込みコールバックでは LED を更新せず、チャネルでメインループに値を渡します。LED の送信中は割り込みを禁止するため、BLE スタックの処理の中で行わないようにしています。
+- `tinygo.org/x/bluetooth` v0.17.0 の HCI 実装（ESP32 で使われるもの）は、Write Without Response を受け取っても無視します。そのためブラウザ側は `writeValueWithResponse` で書き込みます。
+- 同じ実装では、ボード側で `Characteristic.Write()` を呼ぶと自分の `WriteEvent` も呼ばれます。読み出し値を更新するときは、`Value` に渡したスライスを直接書き換えています。
+- スライダーを動かすと書き込みが大量に届きます。そこで、ボード側もブラウザ側も「最新の値だけ」を残し、古い値は捨てます。
 
 ## リポジトリ構成
 
@@ -108,7 +158,7 @@ make monitor                              # シリアルモニタのみ
 ├── matrix/     8x8 LED のフレームバッファ（drivers.Displayer を実装）
 ├── ws2812s3/   ESP32-S3 用 WS2812 ドライバ（ビットバンギング）
 ├── qmi8658/    QMI8658 IMU の最小限のドライバ
-└── examples/   サンプルプログラム
+└── examples/   サンプルプログラム（06_ble_color/web/ はブラウザ側の HTML）
 ```
 
 ### `matrix` パッケージ
@@ -137,7 +187,7 @@ m.Rotation = matrix.Rotate90    // 表示を回転
 
 ### WS2812 ドライバを自前で実装している理由
 
-TinyGo 0.41.1 と `tinygo.org/x/drivers` v0.36.0 の組み合わせでは、`ws2812` パッケージを ESP32-S3 向けにビルドできません。Xtensa 向けの実装が、ESP32-S3 の `machine` パッケージに存在しない `machine.CPUFrequency()` を参照しているためです。
+TinyGo 0.41.1 と `tinygo.org/x/drivers` v0.36.0〜v0.37.0 の組み合わせでは、`ws2812` パッケージを ESP32-S3 向けにビルドできません。Xtensa 向けの実装が、ESP32-S3 の `machine` パッケージに存在しない `machine.CPUFrequency()` を参照しているためです。
 
 そこで [ws2812s3](ws2812s3/ws2812s3.go) では、Xtensa の CPU サイクルカウンタ（`CCOUNT`）で時間を計りながら GPIO を操作しています。
 
@@ -146,9 +196,13 @@ TinyGo 0.41.1 と `tinygo.org/x/drivers` v0.36.0 の組み合わせでは、`ws2
 
 将来、公式ドライバが ESP32-S3 に対応したら、そちらへの置き換えを検討してください。
 
+### Bluetooth について
+
+`tinygo.org/x/bluetooth` は v0.17.0 から、[espradio](https://github.com/tinygo-org/espradio) を通して ESP32-S3 内蔵の BLE 無線を直接使えるようになりました。TinyGo 0.42 以降はターゲットに `espradio` ビルドタグを自動で付けます。TinyGo 0.41 では、タグを手動で付けても無線のバイナリブロブのリンクに失敗します。
+
 ### QMI8658 ドライバについて
 
-`tinygo.org/x/drivers/qmi8658c` もありますが、v0.36.0 には加速度・角速度の下位バイトを読む位置がずれている不具合があります。そのため [qmi8658](qmi8658/qmi8658.go) に、必要な機能だけを実装しました。設定は加速度 ±4g、ジャイロ ±512dps、約 224Hz です。
+`tinygo.org/x/drivers/qmi8658c` もありますが、v0.36.0〜v0.37.0 には加速度・角速度の下位バイトを読む位置がずれている不具合があります。そのため [qmi8658](qmi8658/qmi8658.go) に、必要な機能だけを実装しました。設定は加速度 ±4g、ジャイロ ±512dps、約 224Hz です。
 
 ### エディタ（VS Code / gopls）の設定
 
