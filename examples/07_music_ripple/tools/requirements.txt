@@ -1,0 +1,10 @@
+# export_onnx.py に必要なパッケージ（動作を確認したバージョン）
+beat-this==1.1.0
+torch==2.15.0
+torchaudio==2.11.1
+einops==0.8.2
+rotary-embedding-torch==0.9.2
+soxr==1.1.0
+numpy==2.5.5
+onnx==1.23.2
+onnxscript==0.7.2

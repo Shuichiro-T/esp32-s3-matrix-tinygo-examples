@@ -1,10 +1,10 @@
 // 07_music_ripple: ブラウザで再生している YouTube の音に合わせて LED を光らせます。
 //
-//   - 低音のビート: 中心から四角い波紋が 2x2 → 4x4 → 6x6 → 8x8 と外へ広がる
+//   - ビート: 中心から四角い波紋が 2x2 → 4x4 → 6x6 → 8x8 と外へ広がる（小節の頭は強い波紋）
 //   - 音の出だし（オンセット）: ランダムな 1 点が星のように光って消える
 //   - 色は時間とともに少しずつ虹色に変わる
 //
-// 音の解析（FFT とビート検出）はブラウザ側の web/index.html で行い、
+// 音の解析（ビート検出は学習済みモデル Beat This!）はブラウザ側の web/index.html で行い、
 // 結果だけを Bluetooth LE で受け取ります。ボード側はアニメーションを描きます。
 // 使い方は README の「07_music_ripple」の項を参照してください。
 package main
@@ -22,7 +22,7 @@ import (
 // GATT の UUID。web/index.html と同じ値にしてください。
 var (
 	serviceUUID = mustParseUUID("6e400011-7a3c-4f1b-9d2e-5c8b1f0a3e01")
-	// 音の情報: 4 バイト (低音レベル 0〜255, 低音ビート番号, オンセット番号, 強さ 0〜255)。書き込みのみ。
+	// 音の情報: 4 バイト (低音レベル 0〜255, ビート番号, オンセット番号, 強さ 0〜255)。書き込みのみ。
 	audioUUID = mustParseUUID("6e400012-7a3c-4f1b-9d2e-5c8b1f0a3e01")
 	// 輝度: 1 バイト (0〜255)。上限は board.MaxBrightness で切り詰められる。
 	brightnessUUID = mustParseUUID("6e400013-7a3c-4f1b-9d2e-5c8b1f0a3e01")
@@ -53,7 +53,7 @@ const (
 // audioPacket はブラウザから届く音の情報です。
 type audioPacket struct {
 	bass     uint8 // 低音の大きさ (0〜255)
-	bassBeat uint8 // 低音ビートを検出するたびに 1 増える番号
+	bassBeat uint8 // ビートを検出するたびに 1 増える番号
 	onset    uint8 // オンセットを検出するたびに 1 増える番号
 	strength uint8 // 直近のビート / オンセットの強さ (0〜255)
 }

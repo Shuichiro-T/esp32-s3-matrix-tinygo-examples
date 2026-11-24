@@ -3,3 +3,8 @@ build/
 *.elf
 *.hex
 .DS_Store
+
+# 07_music_ripple のモデル（make serve / make model で自動で作る）と変換用の仮想環境
+examples/07_music_ripple/web/models/
+examples/07_music_ripple/tools/.venv/
+__pycache__/

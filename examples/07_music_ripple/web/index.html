@@ -47,12 +47,17 @@
   .player iframe, .player > div { width: 100%; height: 100%; display: block; }
   label { display: block; font-size: .9rem; color: var(--muted); margin: 14px 0 6px; }
   input[type=range] { width: 100%; }
+  select {
+    font: inherit; width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
   .meter { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
   .bar { flex: 1; height: 14px; border-radius: 7px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
   .bar span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #ff3b30, #ff9500, #ffcc00, #34c759, #0a84ff, #bf5af2); }
   .beat { width: 22px; height: 22px; border-radius: 50%; background: var(--border); transition: background .15s, transform .15s; }
   .beat.on { background: var(--accent); transform: scale(1.25); transition: none; }
   .beat.on.onset { background: #bf5af2; transform: scale(1.1); }
+  .beat.on.downbeat { background: #ff9500; transform: scale(1.45); }
   .stats { font-size: .8rem; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
   .note { font-size: .8rem; color: var(--muted); line-height: 1.6; }
   .note ol { padding-left: 1.2em; margin: 6px 0; }
@@ -90,8 +95,17 @@
       <div class="bar"><span id="bassBar"></span></div>
       <div id="beat" class="beat" title="ビート"></div>
     </div>
-    <div id="stats" class="stats">低音ビート 0 回 / オンセット 0 回 / 送信 0 回/秒</div>
-    <label for="sensitivity">ビートの感度 <span id="sensitivityValue">5</span></label>
+    <div id="stats" class="stats">ビート 0 回 / オンセット 0 回 / 送信 0 回/秒</div>
+    <label for="model">ビート検出のモデル</label>
+    <select id="model">
+      <option value="small0">Beat This! small0（軽量）</option>
+      <option value="final0">Beat This! final0（高精度・WebGPU が必要）</option>
+      <option value="none">使わない（低音の強さで検出）</option>
+    </select>
+    <div id="modelStatus" class="status"></div>
+    <label for="lead">タイミング補正（LED を早める量） <span id="leadValue">100</span> ms</label>
+    <input id="lead" type="range" min="-100" max="300" step="10" value="100">
+    <label for="sensitivity">感度（オンセットと、低音での検出） <span id="sensitivityValue">5</span></label>
     <input id="sensitivity" type="range" min="1" max="10" value="5">
   </div>
 
@@ -100,11 +114,15 @@
       <li>Chrome / Edge のデスクトップ版で、<code>http://localhost</code> から開いてください（Web Bluetooth とタブ音声の取り込みを使います）。</li>
       <li>埋め込みが許可されていない動画は再生できません。</li>
       <li>タブを裏に回すと解析が止まります。このタブを表示したままにしてください。</li>
+      <li>ビート検出には <a href="https://github.com/CPJKU/beat_this">Beat This!</a>（Foscarin, Schlüter, Widmer, ISMIR 2024, MIT License）の学習済みモデルを使っています。曲の頭の数秒はテンポをつかむまで光りません。</li>
     </ol>
   </div>
 </main>
 
-<script>
+<script type="module">
+import { BeatTracker } from "./beat/tracker.js";
+import { SAMPLE_RATE, SpectrogramStream } from "./beat/dsp.js";
+
 // main.go と同じ UUID
 const SERVICE_UUID    = "6e400011-7a3c-4f1b-9d2e-5c8b1f0a3e01";
 const AUDIO_UUID      = "6e400012-7a3c-4f1b-9d2e-5c8b1f0a3e01";
@@ -289,9 +307,29 @@ $("videoForm").addEventListener("submit", (e) => {
 const captureBtn = $("capture"), captureStatus = $("captureStatus");
 const bassBar = $("bassBar"), beatEl = $("beat"), statsEl = $("stats");
 const sensitivityInput = $("sensitivity"), sensitivityValue = $("sensitivityValue");
+const modelSelect = $("model"), modelStatus = $("modelStatus");
+const leadInput = $("lead"), leadValue = $("leadValue");
+
+// Beat This! の設定。窓のフレーム数は 50 フレーム = 1 秒。
+// Worker の中では相対 URL が Worker のスクリプト基準になるので、ページ基準の絶対 URL にして渡す。
+const MODEL_URL = (name) => new URL(`models/beat_this_${name}.onnx`, location.href).href;
+const MODEL_WINDOW = 384; // 推論に使う直近のフレーム数（約 7.7 秒）
+const MIN_NEW_FRAMES = 5; // 前回の推論からこのフレーム数以上たまったら次の推論を頼む
 
 let audioCtx = null, stream = null, analyser = null, freq = null, prevFreq = null;
+let captureNode = null;
 let binLow = 0, binHigh = 0, onsetLow = 0, onsetHigh = 0;
+
+// ビート検出の状態
+let worker = null;
+let spec = null;          // スペクトログラム（Worker を作るたびに作り直す）
+let inferBusy = false;    // Worker が推論中か
+let lastInferFrame = 0;   // 最後に推論を頼んだときのフレーム数
+let tracker = new BeatTracker();
+let modelReady = false;   // モデルでビートを検出できる状態か（false なら低音で検出する）
+let streamStart = 0;      // 取り込んだ音声の先頭の AudioContext 上の時刻
+let lastPredicted = 0;    // 最後に光らせた（または見送った）予測ビートの時刻（ストリーム上の秒）
+let inferMs = 0, backendName = "";
 
 // 解析の状態
 let avgEnergy = 0;      // 低音エネルギーのゆっくりした平均
@@ -313,10 +351,97 @@ function onsetK() {
 sensitivityInput.addEventListener("input", () => {
   sensitivityValue.textContent = sensitivityInput.value;
 });
+leadInput.addEventListener("input", () => {
+  leadValue.textContent = leadInput.value;
+});
+modelSelect.addEventListener("change", () => {
+  if (stream) loadModel();
+});
+
+/* ---- Beat This! の推論（Web Worker） ---- */
+
+function loadModel() {
+  worker?.terminate();
+  worker = null;
+  modelReady = false;
+  tracker.reset();
+  streamStart = -1;
+  spec = null;
+  inferBusy = false;
+  lastInferFrame = 0;
+  const name = modelSelect.value;
+  if (name === "none") {
+    setStatus(modelStatus, "低音の強さでビートを検出しています");
+    return;
+  }
+  setStatus(modelStatus, `モデル ${name} を読み込み中…`);
+  spec = new SpectrogramStream(MODEL_WINDOW);
+  worker = new Worker("beat/worker.js", { type: "module" });
+  worker.onmessage = (e) => onWorkerMessage(e.data);
+  worker.onerror = (e) => onModelError(e.message || "Worker を起動できません");
+  worker.postMessage({ type: "init", modelUrl: MODEL_URL(name), windowFrames: MODEL_WINDOW, backend: name === "final0" ? "webgpu" : "auto" });
+}
+
+function onWorkerMessage(msg) {
+  if (msg.type === "ready") {
+    modelReady = true;
+    backendName = msg.backend === "webgpu" ? "WebGPU" : "WASM";
+    setStatus(modelStatus, `Beat This! ${modelSelect.value}（${backendName}）でテンポを探しています…`, "ok");
+    requestInfer();
+  } else if (msg.type === "result") {
+    inferBusy = false;
+    tracker.addPrediction(msg.start, msg.beat, msg.downbeat);
+    inferMs = inferMs ? inferMs * 0.9 + msg.ms * 0.1 : msg.ms;
+    requestInfer();
+  } else if (msg.type === "error") {
+    onModelError(msg.message);
+  }
+}
+
+// 推論中でなく、新しい音が十分たまっていれば、直近の窓で推論を頼む。
+function requestInfer() {
+  if (!modelReady || inferBusy || !spec) return;
+  if (spec.frameCount < 64 || spec.frameCount - lastInferFrame < MIN_NEW_FRAMES) return;
+  const { start, n, data } = spec.latest(MODEL_WINDOW);
+  lastInferFrame = spec.frameCount;
+  inferBusy = true;
+  worker.postMessage({ type: "infer", start, n, data }, [data.buffer]);
+}
+
+// モデルが使えないときは、低音の強さによる検出に切り替える。
+function onModelError(message) {
+  console.error(message);
+  worker?.terminate();
+  worker = null;
+  spec = null;
+  modelReady = false;
+  // モデルのファイルはリポジトリに含めず、make serve（final0 は make model MODEL=final0）で作る
+  const hint = /\b404\b/.test(message)
+    ? `（モデルのファイルがありません。make ${modelSelect.value === "final0" ? "model MODEL=final0" : "serve EXAMPLE=07_music_ripple"} で作れます）`
+    : modelSelect.value === "final0" ? "（final0 は WebGPU が必要です）" : "";
+  setStatus(modelStatus, `モデルを使えないため、低音の強さで検出します: ${message}${hint}`, "ng");
+}
+
+/* ---- 取り込み ---- */
+
+// Beat This! は 22050Hz の音を前提にしているので、AudioContext もその周波数で作る。
+// ブラウザが違う周波数の MediaStream をつなげない場合は、標準の周波数で作って
+// AudioWorklet 側で変換する（その場合はローパスフィルタで折り返しを防ぐ）。
+function createSource(ctx, audioTracks) {
+  const ms = new MediaStream(audioTracks);
+  try {
+    return { ctx, source: ctx.createMediaStreamSource(ms) };
+  } catch (e) {
+    console.warn("22050Hz の AudioContext に MediaStream をつなげません:", e);
+    ctx.close();
+    const ctx2 = new AudioContext();
+    return { ctx: ctx2, source: ctx2.createMediaStreamSource(ms) };
+  }
+}
 
 async function startCapture() {
   // ユーザー操作の直後に作っておかないと、AudioContext が止まったままになることがある。
-  audioCtx = new AudioContext();
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: true, // Chrome では video を要求しないと音声だけの共有ができない
@@ -333,6 +458,7 @@ async function startCapture() {
     });
   } catch (e) {
     console.error(e);
+    stream = null;
     audioCtx.close(); audioCtx = null;
     setStatus(captureStatus, e.name === "NotAllowedError" ? "キャンセルされました" : "取り込みエラー: " + e.message, "ng");
     return;
@@ -351,8 +477,11 @@ async function startCapture() {
     setStatus(captureStatus, "音声の取り込みが終了しました");
   });
 
+  const { ctx, source } = createSource(audioCtx, audioTracks);
+  audioCtx = ctx;
   await audioCtx.resume();
-  const source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+
+  // 低音レベルとオンセットの解析用
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
   analyser.smoothingTimeConstant = 0; // ビートを鈍らせないよう平滑化しない
@@ -365,6 +494,34 @@ async function startCapture() {
   onsetLow = Math.max(1, Math.floor(ONSET_LOW / hzPerBin));
   onsetHigh = Math.min(freq.length - 1, Math.ceil(ONSET_HIGH / hzPerBin));
 
+  // Beat This! 用: 22050Hz のモノラル音声を受け取り、スペクトログラムを作る
+  await audioCtx.audioWorklet.addModule("beat/capture-worklet.js");
+  let node = source;
+  if (audioCtx.sampleRate !== SAMPLE_RATE) {
+    for (let i = 0; i < 2; i++) {
+      const lp = audioCtx.createBiquadFilter();
+      lp.type = "lowpass";
+      lp.frequency.value = 10000;
+      node.connect(lp);
+      node = lp;
+    }
+  }
+  captureNode = new AudioWorkletNode(audioCtx, "capture-processor", { numberOfOutputs: 1 });
+  node.connect(captureNode);
+  // 出力は無音だが、つないでおかないと処理されないことがある
+  captureNode.connect(audioCtx.destination);
+  captureNode.port.onmessage = (e) => {
+    if (!spec) return;
+    // spec を作ってから最初に届いた音声の先頭が、フレーム番号 0（＝ストリーム上の 0 秒）になる。
+    if (streamStart < 0) {
+      streamStart = e.data.time;
+      lastPredicted = audioCtx.currentTime - streamStart;
+    }
+    spec.push(e.data.samples);
+    requestInfer();
+  };
+  loadModel();
+
   avgEnergy = 0;
   fluxHistory = [];
   captureBtn.textContent = "取り込みを停止";
@@ -375,8 +532,13 @@ async function startCapture() {
 
 function stopCapture() {
   stream?.getTracks().forEach((t) => t.stop());
-  stream = null; analyser = null;
+  stream = null; analyser = null; captureNode = null;
   audioCtx?.close(); audioCtx = null;
+  worker?.terminate(); worker = null;
+  spec = null;
+  modelReady = false;
+  tracker.reset();
+  setStatus(modelStatus, "");
   captureBtn.textContent = "このタブの音声を取り込む";
   captureBtn.className = "wide";
   bassBar.style.width = "0";
@@ -390,6 +552,8 @@ captureBtn.addEventListener("click", () => {
     startCapture();
   }
 });
+
+/* ---- 毎フレームの解析 ---- */
 
 function analyze(now) {
   if (!analyser) return;
@@ -406,12 +570,30 @@ function analyze(now) {
   peakDb = Math.max(peakDb - 0.02, db, -60);
   const level = Math.min(1, Math.max(0, (db - (peakDb - 30)) / 30));
 
-  // 低音ビート: 低音エネルギーが最近の平均より十分大きく跳ね上がったらビート。
-  const ratio = avgEnergy > 0 ? energy / avgEnergy : 0;
-  if (ratio > beatThreshold() && db > peakDb - 25 && now - lastBassAt > MIN_BEAT_INTERVAL) {
-    lastBassAt = now;
-    bassTotal++;
-    fireBeat(Math.min(1, (ratio - beatThreshold()) / 3 + 0.3), "bass");
+  if (modelReady) {
+    // Beat This!: 予測したビートの時刻が来たら光らせる。
+    // BLE の送信と LED の描画にかかる時間のぶん、少し早めに送る。
+    const lead = Number(leadInput.value) / 1000;
+    const t = audioCtx.currentTime - streamStart + lead;
+    for (;;) {
+      const nb = tracker.next(lastPredicted);
+      if (!nb || nb.time > t) break;
+      const late = t - nb.time;
+      const tooClose = nb.time - lastPredicted < nb.period * 0.5; // 予測が少しずれて二重に光るのを防ぐ
+      lastPredicted = nb.time;
+      if (late > 0.1 || tooClose) continue; // 予測が更新されて過去になったビートは光らせない
+      lastBassAt = now;
+      bassTotal++;
+      fireBeat(nb.downbeat ? 1 : 0.6, nb.downbeat ? "downbeat" : "bass", Math.max(0, lead - late));
+    }
+  } else {
+    // 低音ビート: 低音エネルギーが最近の平均より十分大きく跳ね上がったらビート。
+    const ratio = avgEnergy > 0 ? energy / avgEnergy : 0;
+    if (ratio > beatThreshold() && db > peakDb - 25 && now - lastBassAt > MIN_BEAT_INTERVAL) {
+      lastBassAt = now;
+      bassTotal++;
+      fireBeat(Math.min(1, (ratio - beatThreshold()) / 3 + 0.3), "bass", 0);
+    }
   }
   avgEnergy = avgEnergy * 0.95 + energy * 0.05;
 
@@ -436,11 +618,11 @@ function analyze(now) {
     const z = sd > 0 ? (flux - mean) / sd : 0;
     if (z > onsetK() && flux > ONSET_MIN_FLUX && now - lastOnsetAt > MIN_ONSET_INTERVAL) {
       lastOnsetAt = now;
-      // 低音ビートがはっきり出ている曲では、低音ビートだけで波紋を出す。
+      // ビートがはっきり出ている曲では、ビートだけで波紋を出す。
       if (now - lastBassAt > BASS_PRIORITY) {
         onsetTotal++;
-        // 低音ビートと区別できるよう、少し弱めの波紋にする。
-        fireBeat(Math.min(0.6, 0.2 + (z - onsetK()) * 0.1), "onset");
+        // ビートと区別できるよう、少し弱めの波紋にする。
+        fireBeat(Math.min(0.6, 0.2 + (z - onsetK()) * 0.1), "onset", 0);
       }
     }
   }
@@ -449,8 +631,9 @@ function analyze(now) {
 
   bassBar.style.width = (level * 100).toFixed(1) + "%";
 
-  // ボードへ送る: [低音レベル, 低音ビート番号, オンセット番号, 強さ]。変化がなければ送らない。
+  // ボードへ送る: [低音レベル, ビート番号, オンセット番号, 強さ]。変化がなければ送らない。
   // ボードは番号が変わったことで検出を知るので、途中の書き込みが上書きされても取りこぼさない。
+  // 小節の頭（ダウンビート）は強さを最大にして、大きな波紋にする。
   const packet = [Math.round(level * 255), bassCount, onsetCount, Math.round(lastStrength * 255)];
   const key = packet.join(",");
   if (key !== lastSent) {
@@ -461,21 +644,29 @@ function analyze(now) {
   requestAnimationFrame(analyze);
 }
 
-// 番号を進め、ページの丸を光らせる（低音ビートは青、オンセットは紫）。
-// ボード側では、低音ビートで四角い波紋、オンセットで星を出す。
-function fireBeat(strength, kind) {
-  if (kind === "bass") bassCount = (bassCount + 1) & 0xff;
-  else onsetCount = (onsetCount + 1) & 0xff;
+// 番号を進め、ページの丸を光らせる（ビートは青、小節の頭はオレンジ、オンセットは紫）。
+// ボード側では、ビートで四角い波紋、オンセットで星を出す。
+// ページの丸は LED より先に光らないよう、delay 秒（タイミング補正のぶん）遅らせる。
+function fireBeat(strength, kind, delay) {
+  if (kind === "onset") onsetCount = (onsetCount + 1) & 0xff;
+  else bassCount = (bassCount + 1) & 0xff;
   lastStrength = strength;
-  beatEl.classList.remove("bass", "onset");
-  beatEl.classList.add("on", kind);
-  setTimeout(() => beatEl.classList.remove("on"), 60);
+  setTimeout(() => {
+    beatEl.classList.remove("bass", "onset", "downbeat");
+    beatEl.classList.add("on", kind);
+    setTimeout(() => beatEl.classList.remove("on"), 60);
+  }, delay * 1000);
 }
 
-// BLE で実際に送れた回数を 1 秒ごとに表示する（通信速度の目安）。
+// 1 秒ごとに統計を表示する（BLE の送信回数は通信速度の目安）。
 setInterval(() => {
-  statsEl.textContent = `低音ビート ${bassTotal} 回 / オンセット ${onsetTotal} 回 / 送信 ${writeCount} 回/秒`;
+  const bpm = modelReady && tracker.bpm ? ` / テンポ ${tracker.bpm.toFixed(0)} BPM` : "";
+  statsEl.textContent = `ビート ${bassTotal} 回 / オンセット ${onsetTotal} 回 / 送信 ${writeCount} 回/秒${bpm}`;
   writeCount = 0;
+  if (modelReady) {
+    const state = tracker.bpm ? `${tracker.bpm.toFixed(0)} BPM` : "テンポを探しています…";
+    setStatus(modelStatus, `Beat This! ${modelSelect.value}（${backendName}、推論 ${inferMs.toFixed(0)}ms）: ${state}`, "ok");
+  }
 }, 1000);
 </script>
 </body>
